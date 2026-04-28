@@ -1,0 +1,90 @@
+# ==============================================================================
+# Makefile.win  —  NMake build file for Tower Defense Arena
+#
+# Requirements:
+#   Run from an x64 Native Tools Command Prompt for VS 2022
+#   -OR- double-click dev_env.bat (created by install_masm.ps1)
+#
+# Usage:
+#   nmake /f Makefile.win           — build game
+#   nmake /f Makefile.win run       — build + run
+#   nmake /f Makefile.win clean     — delete build artefacts
+#   nmake /f Makefile.win rebuild   — clean then build
+# ==============================================================================
+
+# ── Assembler ──────────────────────────────────────────────────────────────────
+ASM      = ml64
+# /nologo   suppress banner
+# /c        compile only, don't link
+# /Cx       preserve case for PUBLIC and EXTERN symbols
+# /W3       warning level 3
+# /I.       add project root to include search path (for "include src/defs.inc")
+ASMFLAGS = /nologo /c /Cx /W3 /I.
+
+# ── Linker ─────────────────────────────────────────────────────────────────────
+LINK     = link
+# /nologo              suppress banner
+# /SUBSYSTEM:CONSOLE   console application
+# /ENTRY:mainCRTStartup  our hand-written entry point (no CRT startup wrapper)
+# /NODEFAULTLIB        do not link against msvcrt / crt — pure assembly only
+LFLAGS   = /nologo /SUBSYSTEM:CONSOLE /ENTRY:mainCRTStartup /NODEFAULTLIB
+LIBS     = kernel32.lib user32.lib
+
+# ── Output ─────────────────────────────────────────────────────────────────────
+TARGET   = tower_defense.exe
+OBJDIR   = obj
+
+# ── Object files (explicit list — NMake does not support wildcards here) ───────
+OBJS = \
+    $(OBJDIR)\data.obj      \
+    $(OBJDIR)\score.obj     \
+    $(OBJDIR)\enemies.obj   \
+    $(OBJDIR)\towers.obj    \
+    $(OBJDIR)\collision.obj \
+    $(OBJDIR)\renderer.obj  \
+    $(OBJDIR)\input.obj     \
+    $(OBJDIR)\game_loop.obj \
+    $(OBJDIR)\main.obj
+
+# ==============================================================================
+# Targets
+# ==============================================================================
+
+all: dirs $(TARGET)
+    @echo.
+    @echo  === Build complete: $(TARGET) ===
+    @echo.
+
+# Create obj\ directory if it does not exist
+dirs:
+    @if not exist $(OBJDIR) mkdir $(OBJDIR)
+
+# Link all object files into the final .exe
+$(TARGET): $(OBJS)
+    $(LINK) $(LFLAGS) /OUT:$(TARGET) $(OBJS) $(LIBS)
+
+# Run the game immediately after building
+run: all
+    $(TARGET)
+
+# Clean build artefacts
+clean:
+    @if exist $(OBJDIR) rmdir /s /q $(OBJDIR)
+    @if exist $(TARGET) del /q $(TARGET)
+    @echo  === Cleaned ===
+
+# Clean then rebuild from scratch
+rebuild: clean all
+
+# ==============================================================================
+# Inference rule: src\<name>.asm  ->  obj\<name>.obj
+#
+# NMake inference rule syntax:
+#   {<source-dir>}.<src-ext>{<dest-dir>}.<dest-ext>:
+#       <build command>
+#
+# $<  expands to the source file path (e.g.  src\main.asm)
+# $@  expands to the target file path  (e.g.  obj\main.obj)
+# ==============================================================================
+{src\}.asm{$(OBJDIR)\}.obj:
+    $(ASM) $(ASMFLAGS) /Fo$@ $<

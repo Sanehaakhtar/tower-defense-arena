@@ -6,7 +6,7 @@
 option casemap:none
 
 STARTING_LIVES          equ 3
-STARTING_GOLD           equ 35
+STARTING_GOLD           equ 50
 STATE_MENU              equ 0
 STATE_LEVEL_SELECT      equ 5
 TOWER_BASIC             equ 0
@@ -204,7 +204,8 @@ public map_tiles
 map_tiles       db SCREEN_WIDTH * SCREEN_HEIGHT dup(0)
 
 public screen_buf
-screen_buf      db SCREEN_WIDTH * SCREEN_HEIGHT dup(' ')
+; CHAR_INFO buffer: 4 bytes per cell (WORD char + WORD attributes)
+screen_buf      db SCREEN_WIDTH * SCREEN_HEIGHT * 4 dup(0)
 
 ; --- Score ---
 public player_score

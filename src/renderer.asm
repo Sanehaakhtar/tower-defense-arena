@@ -1,6 +1,21 @@
 ; ============================================================================
-; renderer.asm — All display output via Windows Console API
-; Tower Defense Arena
+; renderer.asm — Console rendering with full color via WriteConsoleOutputA
+; Uses CHAR_INFO buffer: 2 bytes per cell (char byte + attribute byte)
+;
+; Color attributes (foreground | background<<4):
+;   0=Black 1=DkBlue 2=DkGreen 3=DkCyan 4=DkRed 5=DkMag 6=DkYellow 7=Gray
+;   8=DkGray 9=Blue A=Green B=Cyan C=Red D=Magenta E=Yellow F=White
+;
+; Examples:
+;   0x07 = gray text, black bg    (normal)
+;   0x0A = green text, black bg   (path)
+;   0x0C = red text, black bg     (enemy)
+;   0x0E = yellow text, black bg  (basic tower)
+;   0x0B = cyan text, black bg    (sniper tower)
+;   0x0D = magenta text, black bg (splash tower)
+;   0x2F = white text, green bg   (HUD)
+;   0x4F = white text, red bg     (lives/danger)
+;   0x1F = white text, blue bg    (title)
 ; ============================================================================
 
 option casemap:none
@@ -11,13 +26,39 @@ public renderer_init
 public renderer_draw
 
 ; ============================================================================
-; Local string constants — must be in .data, NOT inline in .code
+; Color attribute constants
+; ============================================================================
+ATTR_DEFAULT    equ 07h   ; gray on black
+ATTR_PATH       equ 02h   ; dark green on black  (path dots)
+ATTR_SPAWN      equ 0Ah   ; bright green on black (spawn S)
+ATTR_BASE       equ 0Ch   ; red on black          (base B)
+ATTR_ENEMY      equ 0Ch   ; red on black          (enemy E)
+ATTR_TOWER_T    equ 0Eh   ; yellow on black       (basic T)
+ATTR_TOWER_R    equ 0Bh   ; cyan on black         (sniper R)
+ATTR_TOWER_X    equ 0Dh   ; magenta on black      (splash X)
+ATTR_HUD        equ 0Fh   ; bright white on black (HUD text)
+ATTR_GOLD       equ 0Eh   ; yellow on black       (gold value)
+ATTR_LIVES      equ 0Ch   ; red on black          (lives value)
+ATTR_WAVE       equ 0Bh   ; cyan on black         (wave info)
+ATTR_TITLE      equ 0Ah   ; green on black        (titles)
+ATTR_LOCKED     equ 08h   ; dark gray on black    (locked)
+ATTR_OPEN       equ 0Ah   ; green on black        (open)
+ATTR_SELECTED   equ 0Eh   ; yellow on black       (selected slot)
+ATTR_CTRL       equ 07h   ; gray on black         (controls)
+ATTR_MSG        equ 0Eh   ; yellow on black       (messages)
+ATTR_GAMEOVER   equ 0Ch   ; red on black          (game over)
+ATTR_WIN        equ 0Ah   ; green on black        (you win)
+ATTR_CURSOR     equ 0Fh   ; white on black        (cursor *)
+ATTR_BG         equ 00h   ; black on black        (background)
+
+; ============================================================================
+; Local data
 ; ============================================================================
 .data
 
 rnd_lbracket    db '[', 0
 rnd_rbracket    db ']', 0
-rnd_open        db 'OPEN  ', 0
+rnd_open        db 'OPEN', 0
 rnd_str_lvl     db 'Lvl:', 0
 rnd_ch_path     db '.', 0
 rnd_ch_spawn    db 'S', 0
@@ -27,15 +68,25 @@ rnd_ch_sniper   db 'R', 0
 rnd_ch_splash   db 'X', 0
 rnd_ch_enemy    db 'E', 0
 rnd_ch_cursor   db '*', 0
+rnd_ch_space    db ' ', 0
+hline_char      db '=', 0   ; set before calling draw_hline
 
-; SMALL_RECTs for console resize (must be in .data)
 rnd_tiny_rect   dw 0, 0, 1, 1
 rnd_win_rect    dw 0, 0, SCREEN_WIDTH-1, SCREEN_HEIGHT-1
+
+; WriteConsoleOutputA needs a SMALL_RECT for the region written
+rnd_write_rect  dw 0, 0, SCREEN_WIDTH-1, SCREEN_HEIGHT-1
+
+; Buffer size COORD for WriteConsoleOutputA (packed as dword: low=X, high=Y)
+rnd_buf_size    dd (SCREEN_HEIGHT SHL 16) OR SCREEN_WIDTH
+
+; Buffer coord top-left (0,0) packed as dword
+rnd_buf_coord   dd 0
 
 .code
 
 ; ============================================================================
-; renderer_init — Lock console to SCREEN_WIDTH x SCREEN_HEIGHT, hide cursor
+; renderer_init
 ; ============================================================================
 renderer_init proc
     sub     rsp, 40
@@ -63,7 +114,7 @@ renderer_init proc
 renderer_init endp
 
 ; ============================================================================
-; renderer_draw — Dispatch based on game_state
+; renderer_draw
 ; ============================================================================
 renderer_draw proc
     sub     rsp, 40
@@ -103,145 +154,230 @@ renderer_draw proc
 renderer_draw endp
 
 ; ============================================================================
-; write_str_at  ecx=x  edx=y  r8=ptr
-; Writes string into screen_buf at (x,y) — no console call, no flicker
+; buf_put_char — write CHAR_INFO into screen_buf at (x,y)
+; CHAR_INFO = WORD char (ascii in low byte, 0 in high) + WORD attributes
+; So 4 bytes total per cell: [char_lo][char_hi=0][attr_lo][attr_hi=0]
+; Inputs: ecx=x, edx=y, r8b=char, r9b=attribute
 ; ============================================================================
-write_str_at proc
-    sub     rsp, 40
-
-    ; offset = y * SCREEN_WIDTH + x
+buf_put_char proc
+    ; offset = (y * SCREEN_WIDTH + x) * 4
     mov     eax, edx
     imul    eax, SCREEN_WIDTH
     add     eax, ecx
+    imul    eax, 4                     ; *4 for CHAR_INFO size
 
-    ; clamp: if offset >= W*H, skip
-    cmp     eax, SCREEN_WIDTH * SCREEN_HEIGHT
+    cmp     eax, SCREEN_WIDTH * SCREEN_HEIGHT * 4
     jge     @@done
 
     lea     rdi, [screen_buf]
-    add     rdi, rax                   ; rdi = &screen_buf[offset]
-
-@@copy:
-    cmp     byte ptr [r8], 0
-    je      @@done
-    ; clamp per-char: don't write past end of buffer
-    mov     al, [r8]
-    mov     [rdi], al
-    inc     r8
-    inc     rdi
-    ; check we haven't gone past buffer end
-    lea     rax, [screen_buf]
-    add     rax, SCREEN_WIDTH * SCREEN_HEIGHT
-    cmp     rdi, rax
-    jge     @@done
-    jmp     @@copy
+    add     rdi, rax
+    movzx   r10d, r8b
+    mov     word ptr [rdi],   r10w     ; char as WORD (hi byte = 0)
+    movzx   r10d, r9b
+    mov     word ptr [rdi+2], r10w     ; attribute as WORD (hi byte = 0)
 
 @@done:
+    ret
+buf_put_char endp
+
+; ============================================================================
+; write_str_at_col — write string into buffer with color
+; Inputs: ecx=x, edx=y, r8=str_ptr, r9b=attribute
+; ============================================================================
+write_str_at_col proc
+    push    rbx
+    push    r12
+    push    r13
+    sub     rsp, 40
+
+    mov     ebx, ecx                   ; x
+    mov     r12d, edx                  ; y
+    mov     r13, r8                    ; str ptr
+    movzx   r10d, r9b                  ; attribute
+
+@@loop:
+    movzx   eax, byte ptr [r13]
+    test    eax, eax
+    jz      @@done
+
+    ; bounds check x
+    cmp     ebx, SCREEN_WIDTH
+    jge     @@done
+
+    mov     ecx, ebx
+    mov     edx, r12d
+    mov     r8b, al
+    mov     r9b, r10b
+    call    buf_put_char
+
+    inc     ebx
+    inc     r13
+    jmp     @@loop
+
+@@done:
+    add     rsp, 40
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+write_str_at_col endp
+
+; ============================================================================
+; write_str_at — write string with default color (for compatibility)
+; Inputs: ecx=x, edx=y, r8=str_ptr
+; ============================================================================
+write_str_at proc
+    sub     rsp, 40
+    mov     r9b, ATTR_DEFAULT
+    call    write_str_at_col
     add     rsp, 40
     ret
 write_str_at endp
 
 ; ============================================================================
-; write_num_at  ecx=x  edx=y  r8d=number
+; write_num_at_col — write number into buffer with color
+; Inputs: ecx=x, edx=y, r8d=number, r9b=attribute
 ; ============================================================================
-write_num_at proc
-    sub     rsp, 88
+write_num_at_col proc
+    push    rbx
+    push    r12
+    push    r13
+    sub     rsp, 48
 
-    mov     dword ptr [rsp+40], ecx
-    mov     dword ptr [rsp+44], edx
+    mov     dword ptr [rsp+32], ecx
+    mov     dword ptr [rsp+36], edx
+    movzx   r13d, r9b                  ; save attribute
     mov     eax, r8d
 
-    mov     qword ptr [rsp+48], 0
-    mov     qword ptr [rsp+56], 0
-
-    lea     r9, [rsp+62]
+    ; convert number to string in temp buffer
+    lea     rbx, [rsp+44]              ; end of small buffer
+    mov     byte ptr [rbx], 0
 
     test    eax, eax
     jnz     @@conv
-    mov     byte ptr [r9], '0'
-    dec     r9
+    dec     rbx
+    mov     byte ptr [rbx], '0'
     jmp     @@write
 
 @@conv:
     jns     @@pos
     neg     eax
 @@pos:
-    mov     ecx, 10
+    mov     r12d, 10
 @@div:
     test    eax, eax
     jz      @@write
     xor     edx, edx
-    div     ecx
+    div     r12d
     add     dl, '0'
-    mov     [r9], dl
-    dec     r9
+    dec     rbx
+    mov     [rbx], dl
     jmp     @@div
 
 @@write:
-    inc     r9
-    mov     ecx, dword ptr [rsp+40]
-    mov     edx, dword ptr [rsp+44]
-    mov     r8, r9
-    call    write_str_at
+    mov     ecx, dword ptr [rsp+32]
+    mov     edx, dword ptr [rsp+36]
+    mov     r8, rbx
+    mov     r9b, r13b
+    call    write_str_at_col
 
-    add     rsp, 88
+    add     rsp, 48
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+write_num_at_col endp
+
+; ============================================================================
+; write_num_at — write number with default color
+; ============================================================================
+write_num_at proc
+    sub     rsp, 40
+    mov     r9b, ATTR_DEFAULT
+    call    write_num_at_col
+    add     rsp, 40
     ret
 write_num_at endp
 
+
 ; ============================================================================
-; clear_screen — move cursor to 0,0 only (screen_buf handles actual output)
-; We no longer blast FillConsole every frame — frame_render does one write
+; clear_screen — fill entire CHAR_INFO buffer with space + default attribute
+; Each cell = 4 bytes: WORD char (' '=0x0020) + WORD attr
 ; ============================================================================
 clear_screen proc
+    push    rbx
     sub     rsp, 40
 
-    ; Fill screen_buf with spaces
-    lea     rdi, [screen_buf]
+    lea     rbx, [screen_buf]
     mov     ecx, SCREEN_WIDTH * SCREEN_HEIGHT
-    mov     al, ' '
-    rep     stosb
-
+@@loop:
+    test    ecx, ecx
+    jz      @@done
+    mov     word ptr [rbx],   20h      ; space character as WORD
+    mov     word ptr [rbx+2], ATTR_DEFAULT ; attribute as WORD
+    add     rbx, 4
+    dec     ecx
+    jmp     @@loop
+@@done:
     add     rsp, 40
+    pop     rbx
     ret
 clear_screen endp
 
 ; ============================================================================
-; frame_render — write each row at exact position (handles any console width)
-; Uses SetConsoleCursorPosition + WriteConsoleA per row = correct alignment
+; frame_render — blast screen_buf to console via WriteConsoleOutputA
+; WriteConsoleOutputA(hStdOut, buf, bufSize, bufCoord, &writeRegion)
 ; ============================================================================
 frame_render proc
     sub     rsp, 40
 
-    xor     ebx, ebx                   ; row = 0
-
-@@row_loop:
-    cmp     ebx, SCREEN_HEIGHT
-    jge     @@done
-
-    ; SetConsoleCursorPosition(hStdOut, COORD{x=0, y=row})
-    mov     rcx, [hStdOut]
-    mov     edx, ebx
-    shl     edx, 16                    ; Y in high word, X=0 in low word
-    call    SetConsoleCursorPosition
-
-    ; WriteConsoleA(hStdOut, &screen_buf[row*W], W, &written, NULL)
     mov     rcx, [hStdOut]
     lea     rdx, [screen_buf]
-    mov     eax, ebx
-    imul    eax, SCREEN_WIDTH
-    add     rdx, rax                   ; rdx = row start in buffer
-    mov     r8d, SCREEN_WIDTH
-    lea     r9, [temp_written]
-    mov     qword ptr [rsp+32], 0
-    call    WriteConsoleA
+    mov     r8d,  [rnd_buf_size]       ; COORD{W,H} as dword
+    mov     r9d,  [rnd_buf_coord]      ; COORD{0,0}
+    lea     rax, [rnd_write_rect]
+    mov     [rsp+32], rax
+    call    WriteConsoleOutputA
 
-    inc     ebx
-    jmp     @@row_loop
-
-@@done:
     add     rsp, 40
     ret
 frame_render endp
+
+; ============================================================================
+; draw_hline — draw horizontal bar
+; Inputs: ecx=x, edx=y, r8d=count, r9b=attr
+; Uses hline_char (module var) for the character to draw
+; ============================================================================
+draw_hline proc
+    push    rbx
+    push    r12
+    push    r13
+    sub     rsp, 40
+
+    mov     ebx, ecx
+    mov     r12d, edx
+    mov     r13d, r8d
+    movzx   r10d, r9b
+    movzx   r11d, byte ptr [hline_char]
+
+@@loop:
+    test    r13d, r13d
+    jz      @@done
+    mov     ecx, ebx
+    mov     edx, r12d
+    mov     r8b,  r11b
+    mov     r9b,  r10b
+    call    buf_put_char
+    inc     ebx
+    dec     r13d
+    jmp     @@loop
+@@done:
+    add     rsp, 40
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+draw_hline endp
 
 ; ============================================================================
 ; draw_menu_screen
@@ -251,20 +387,45 @@ draw_menu_screen proc
 
     call    clear_screen
 
+    ; Background — fill whole screen with dark blue tint
+    ; (just use clear_screen default for now, add border)
+
+    ; Top border line
+    mov     ecx, 0
+    mov     edx, 0
+    mov     r8d, SCREEN_WIDTH
+    mov     r9b, ATTR_TITLE
+    mov     byte ptr [hline_char], '='
+    call    draw_hline
+
+    ; Bottom border
+    mov     ecx, 0
+    mov     edx, SCREEN_HEIGHT - 1
+    mov     r8d, SCREEN_WIDTH
+    mov     r9b, ATTR_TITLE
+    mov     byte ptr [hline_char], '='
+    call    draw_hline
+
+    ; Title
     mov     ecx, 16
     mov     edx, 9
     lea     r8, [str_menu_title]
-    call    write_str_at
+    mov     r9b, ATTR_TITLE
+    call    write_str_at_col
 
+    ; Description
     mov     ecx, 10
     mov     edx, 12
     lea     r8, [str_menu_quit]
-    call    write_str_at
+    mov     r9b, ATTR_HUD
+    call    write_str_at_col
 
+    ; Play prompt
     mov     ecx, 14
     mov     edx, 15
     lea     r8, [str_menu_play]
-    call    write_str_at
+    mov     r9b, ATTR_SELECTED
+    call    write_str_at_col
 
     call    frame_render
     add     rsp, 40
@@ -272,24 +433,46 @@ draw_menu_screen proc
 draw_menu_screen endp
 
 ; ============================================================================
-; draw_level_select — 5 slots, LEFT/RIGHT nav, locked/open state
+; draw_level_select
 ; ============================================================================
 draw_level_select proc
+    push    rbx
+    push    r12
     sub     rsp, 40
 
     call    clear_screen
 
+    ; Border
+    mov     ecx, 0
+    mov     edx, 0
+    mov     r8d, SCREEN_WIDTH
+    mov     r9b, ATTR_TITLE
+    mov     byte ptr [hline_char], '='
+    call    draw_hline
+
+    mov     ecx, 0
+    mov     edx, SCREEN_HEIGHT - 1
+    mov     r8d, SCREEN_WIDTH
+    mov     r9b, ATTR_TITLE
+    mov     byte ptr [hline_char], '='
+    call    draw_hline
+
+    ; Title
     mov     ecx, 20
     mov     edx, 8
     lea     r8, [str_level_select_title]
-    call    write_str_at
+    mov     r9b, ATTR_TITLE
+    call    write_str_at_col
 
+    ; Hint
     mov     ecx, 11
     mov     edx, 19
     lea     r8, [str_level_select_hint]
-    call    write_str_at
+    mov     r9b, ATTR_CTRL
+    call    write_str_at_col
 
-    xor     ebx, ebx                   ; i = 0
+    ; Draw 5 level slots
+    xor     ebx, ebx
 
 @@slot_loop:
     cmp     ebx, MAX_LEVELS
@@ -299,57 +482,84 @@ draw_level_select proc
     mov     eax, ebx
     imul    eax, 11
     add     eax, 5
-    mov     dword ptr [rsp+32], eax    ; save slot x
+    mov     r12d, eax                  ; slot x in r12
 
-    ; Draw bracket if this is the cursor position
+    ; Is this the cursor?
     cmp     ebx, [level_cursor]
-    jne     @@draw_label
+    jne     @@not_selected
 
-    mov     ecx, dword ptr [rsp+32]
+    ; Draw brackets in yellow
+    mov     ecx, r12d
     dec     ecx
     mov     edx, 12
     lea     r8, [rnd_lbracket]
-    call    write_str_at
+    mov     r9b, ATTR_SELECTED
+    call    write_str_at_col
 
-    mov     ecx, dword ptr [rsp+32]
+    mov     ecx, r12d
     add     ecx, 7
     mov     edx, 12
     lea     r8, [rnd_rbracket]
-    call    write_str_at
+    mov     r9b, ATTR_SELECTED
+    call    write_str_at_col
 
-@@draw_label:
-    ; "LEVEL " text
-    mov     ecx, dword ptr [rsp+32]
-    mov     edx, 12
-    lea     r8, [str_level_label]
-    call    write_str_at
-
-    ; level number
-    mov     ecx, dword ptr [rsp+32]
-    add     ecx, 6
-    mov     edx, 12
-    mov     r8d, ebx
-    inc     r8d
-    call    write_num_at
-
-    ; locked or open?
+@@not_selected:
+    ; Is level unlocked?
     mov     eax, ebx
     mov     ecx, [levels_unlocked]
     dec     ecx
     cmp     eax, ecx
-    jle     @@show_open
+    jle     @@draw_open
 
-    mov     ecx, dword ptr [rsp+32]
+    ; LOCKED — gray
+    mov     ecx, r12d
+    mov     edx, 12
+    lea     r8, [str_level_label]
+    mov     r9b, ATTR_LOCKED
+    call    write_str_at_col
+
+    mov     ecx, r12d
+    add     ecx, 6
+    mov     edx, 12
+    mov     r8d, ebx
+    inc     r8d
+    mov     r9b, ATTR_LOCKED
+    call    write_num_at_col
+
+    mov     ecx, r12d
     mov     edx, 14
     lea     r8, [str_locked]
-    call    write_str_at
+    mov     r9b, ATTR_LOCKED
+    call    write_str_at_col
     jmp     @@next_slot
 
-@@show_open:
-    mov     ecx, dword ptr [rsp+32]
+@@draw_open:
+    ; Determine label color: selected=yellow, unlocked=green
+    mov     r10b, ATTR_OPEN
+    cmp     ebx, [level_cursor]
+    jne     @@label_color_done
+    mov     r10b, ATTR_SELECTED
+@@label_color_done:
+
+    mov     ecx, r12d
+    mov     edx, 12
+    lea     r8, [str_level_label]
+    mov     r9b, r10b
+    call    write_str_at_col
+
+    mov     ecx, r12d
+    add     ecx, 6
+    mov     edx, 12
+    mov     r8d, ebx
+    inc     r8d
+    mov     r9b, r10b
+    call    write_num_at_col
+
+    mov     ecx, r12d
     mov     edx, 14
     lea     r8, [rnd_open]
-    call    write_str_at
+    mov     r9b, ATTR_OPEN
+    call    write_str_at_col
 
 @@next_slot:
     inc     ebx
@@ -358,6 +568,8 @@ draw_level_select proc
 @@slots_done:
     call    frame_render
     add     rsp, 40
+    pop     r12
+    pop     rbx
     ret
 draw_level_select endp
 
@@ -369,96 +581,136 @@ draw_game_screen proc
 
     call    clear_screen
 
-    ; Wave X/3
+    ; HUD top bar background (row 0)
+    mov     ecx, 0
+    mov     edx, 0
+    mov     r8d, SCREEN_WIDTH
+    mov     r9b, ATTR_HUD
+    mov     byte ptr [hline_char], ' '
+    call    draw_hline
+
+    ; Wave X/3 — cyan
     mov     ecx, 0
     mov     edx, 0
     lea     r8, [str_wave_text]
-    call    write_str_at
+    mov     r9b, ATTR_WAVE
+    call    write_str_at_col
 
     mov     ecx, 6
     mov     edx, 0
     mov     r8d, [wave_in_level]
-    call    write_num_at
+    mov     r9b, ATTR_WAVE
+    call    write_num_at_col
 
     mov     ecx, 7
     mov     edx, 0
     lea     r8, [str_wave_of]
-    call    write_str_at
+    mov     r9b, ATTR_WAVE
+    call    write_str_at_col
 
     mov     ecx, 8
     mov     edx, 0
     mov     r8d, WAVES_PER_LEVEL
-    call    write_num_at
+    mov     r9b, ATTR_WAVE
+    call    write_num_at_col
 
-    ; Lvl:N
+    ; Lvl — cyan
     mov     ecx, 11
     mov     edx, 0
     lea     r8, [rnd_str_lvl]
-    call    write_str_at
+    mov     r9b, ATTR_WAVE
+    call    write_str_at_col
 
     mov     ecx, 15
     mov     edx, 0
     mov     r8d, [current_level]
-    call    write_num_at
+    mov     r9b, ATTR_WAVE
+    call    write_num_at_col
 
-    ; Score
+    ; Score — white
     mov     ecx, 18
     mov     edx, 0
     lea     r8, [str_score_text]
-    call    write_str_at
+    mov     r9b, ATTR_HUD
+    call    write_str_at_col
 
     mov     ecx, 25
     mov     edx, 0
     mov     r8d, [player_score]
-    call    write_num_at
+    mov     r9b, ATTR_HUD
+    call    write_num_at_col
 
-    ; Gold
+    ; Gold — yellow
     mov     ecx, 32
     mov     edx, 0
     lea     r8, [str_gold_text]
-    call    write_str_at
+    mov     r9b, ATTR_GOLD
+    call    write_str_at_col
 
     mov     ecx, 38
     mov     edx, 0
     mov     r8d, [player_gold]
-    call    write_num_at
+    mov     r9b, ATTR_GOLD
+    call    write_num_at_col
 
-    ; Lives
+    ; Lives — red
     mov     ecx, 44
     mov     edx, 0
     lea     r8, [str_lives_text]
-    call    write_str_at
+    mov     r9b, ATTR_LIVES
+    call    write_str_at_col
 
     mov     ecx, 51
     mov     edx, 0
     mov     r8d, [player_lives]
-    call    write_num_at
+    mov     r9b, ATTR_LIVES
+    call    write_num_at_col
 
     call    draw_map
     call    draw_towers
     call    draw_enemies
     call    draw_cursor
 
-    ; Bottom controls
+    ; Bottom bar background (row SCREEN_HEIGHT-2 and -1)
     mov     ecx, 0
     mov     edx, SCREEN_HEIGHT - 2
-    lea     r8, [str_controls]
-    call    write_str_at
+    mov     r8d, SCREEN_WIDTH
+    mov     r9b, ATTR_CTRL
+    mov     byte ptr [hline_char], ' '
+    call    draw_hline
 
     mov     ecx, 0
     mov     edx, SCREEN_HEIGHT - 1
+    mov     r8d, SCREEN_WIDTH
+    mov     r9b, ATTR_CTRL
+    mov     byte ptr [hline_char], ' '
+    call    draw_hline
+
+    ; Controls — gray
+    mov     ecx, 0
+    mov     edx, SCREEN_HEIGHT - 2
+    lea     r8, [str_controls]
+    mov     r9b, ATTR_CTRL
+    call    write_str_at_col
+
+    ; Tower options — colored by type
+    mov     ecx, 0
+    mov     edx, SCREEN_HEIGHT - 1
     lea     r8, [str_tower_basic]
-    call    write_str_at
+    mov     r9b, ATTR_TOWER_T
+    call    write_str_at_col
 
     mov     ecx, 14
     mov     edx, SCREEN_HEIGHT - 1
     lea     r8, [str_tower_sniper]
-    call    write_str_at
+    mov     r9b, ATTR_TOWER_R
+    call    write_str_at_col
 
     mov     ecx, 29
     mov     edx, SCREEN_HEIGHT - 1
     lea     r8, [str_tower_splash]
-    call    write_str_at
+    mov     r9b, ATTR_TOWER_X
+    call    write_str_at_col
 
     ; State messages
     mov     eax, [game_state]
@@ -472,14 +724,16 @@ draw_game_screen proc
     mov     ecx, 0
     mov     edx, SCREEN_HEIGHT - 3
     lea     r8, [str_wave_complete]
-    call    write_str_at
+    mov     r9b, ATTR_MSG
+    call    write_str_at_col
     jmp     @@done
 
 @@level_msg:
     mov     ecx, 0
     mov     edx, SCREEN_HEIGHT - 3
     lea     r8, [str_level_complete]
-    call    write_str_at
+    mov     r9b, ATTR_WIN
+    call    write_str_at_col
 
 @@done:
     call    frame_render
@@ -488,7 +742,7 @@ draw_game_screen proc
 draw_game_screen endp
 
 ; ============================================================================
-; draw_map
+; draw_map — colored path tiles
 ; ============================================================================
 draw_map proc
     push    rbx
@@ -497,12 +751,12 @@ draw_map proc
     sub     rsp, 40
 
     lea     rsi, [map_tiles]
-    xor     ebx, ebx                   ; row counter — callee-saved
+    xor     ebx, ebx
 
 @@row:
     cmp     ebx, SCREEN_HEIGHT
     jge     @@done
-    xor     r12d, r12d                 ; col counter — callee-saved
+    xor     r12d, r12d
 
 @@col:
     cmp     r12d, SCREEN_WIDTH
@@ -525,21 +779,24 @@ draw_map proc
     mov     ecx, r12d
     mov     edx, ebx
     lea     r8, [rnd_ch_path]
-    call    write_str_at               ; rbx/r12/rsi preserved
+    mov     r9b, ATTR_PATH
+    call    write_str_at_col
     jmp     @@next_col
 
 @@spawn:
     mov     ecx, r12d
     mov     edx, ebx
     lea     r8, [rnd_ch_spawn]
-    call    write_str_at
+    mov     r9b, ATTR_SPAWN
+    call    write_str_at_col
     jmp     @@next_col
 
 @@base:
     mov     ecx, r12d
     mov     edx, ebx
     lea     r8, [rnd_ch_base]
-    call    write_str_at
+    mov     r9b, ATTR_BASE
+    call    write_str_at_col
 
 @@next_col:
     inc     r12d
@@ -558,7 +815,7 @@ draw_map proc
 draw_map endp
 
 ; ============================================================================
-; draw_towers
+; draw_towers — each tower type has its own color
 ; ============================================================================
 draw_towers proc
     push    rbx
@@ -566,7 +823,7 @@ draw_towers proc
     sub     rsp, 40
 
     lea     rsi, [towers]
-    xor     ebx, ebx                   ; use rbx as loop counter (callee-saved)
+    xor     ebx, ebx
 
 @@loop:
     cmp     ebx, MAX_TOWERS
@@ -580,18 +837,28 @@ draw_towers proc
     je      @@next
 
     mov     edx, [rdi + TOWER_TYPE]
-    lea     r8, [rnd_ch_basic]
+
     cmp     edx, TOWER_BASIC
-    je      @@draw
-    lea     r8, [rnd_ch_sniper]
+    jne     @@try_sniper
+    lea     r8, [rnd_ch_basic]
+    mov     r9b, ATTR_TOWER_T
+    jmp     @@draw
+
+@@try_sniper:
     cmp     edx, TOWER_SNIPER
-    je      @@draw
+    jne     @@splash
+    lea     r8, [rnd_ch_sniper]
+    mov     r9b, ATTR_TOWER_R
+    jmp     @@draw
+
+@@splash:
     lea     r8, [rnd_ch_splash]
+    mov     r9b, ATTR_TOWER_X
 
 @@draw:
     mov     ecx, [rdi + TOWER_X]
     mov     edx, [rdi + TOWER_Y]
-    call    write_str_at               ; rbx/rsi preserved across this call
+    call    write_str_at_col
 
 @@next:
     inc     ebx
@@ -605,7 +872,7 @@ draw_towers proc
 draw_towers endp
 
 ; ============================================================================
-; draw_enemies
+; draw_enemies — bright red
 ; ============================================================================
 draw_enemies proc
     push    rbx
@@ -613,7 +880,7 @@ draw_enemies proc
     sub     rsp, 40
 
     lea     rsi, [enemies]
-    xor     ebx, ebx                   ; use rbx as loop counter (callee-saved)
+    xor     ebx, ebx
 
 @@loop:
     cmp     ebx, MAX_ENEMIES
@@ -631,7 +898,8 @@ draw_enemies proc
     mov     ecx, [rdi + ENEMY_X]
     mov     edx, [rdi + ENEMY_Y]
     lea     r8, [rnd_ch_enemy]
-    call    write_str_at               ; rbx/rsi preserved across this call
+    mov     r9b, ATTR_ENEMY
+    call    write_str_at_col
 
 @@next:
     inc     ebx
@@ -645,7 +913,7 @@ draw_enemies proc
 draw_enemies endp
 
 ; ============================================================================
-; draw_cursor
+; draw_cursor — blinking white *
 ; ============================================================================
 draw_cursor proc
     sub     rsp, 40
@@ -666,7 +934,8 @@ draw_cursor proc
     mov     ecx, [cursor_x]
     mov     edx, [cursor_y]
     lea     r8, [rnd_ch_cursor]
-    call    write_str_at
+    mov     r9b, ATTR_CURSOR
+    call    write_str_at_col
 
 @@done:
     add     rsp, 40
@@ -681,32 +950,54 @@ draw_end_screen proc
 
     call    clear_screen
 
+    ; Border
+    mov     ecx, 0
+    mov     edx, 0
+    mov     r8d, SCREEN_WIDTH
+    mov     r9b, ATTR_TITLE
+    mov     byte ptr [hline_char], '='
+    call    draw_hline
+
+    mov     ecx, 0
+    mov     edx, SCREEN_HEIGHT - 1
+    mov     r8d, SCREEN_WIDTH
+    mov     r9b, ATTR_TITLE
+    mov     byte ptr [hline_char], '='
+    call    draw_hline
+
     mov     eax, [game_state]
     cmp     eax, STATE_WIN
     je      @@win
 
+    ; Game Over — red
     mov     ecx, 9
     mov     edx, 10
     lea     r8, [str_game_over]
-    call    write_str_at
+    mov     r9b, ATTR_GAMEOVER
+    call    write_str_at_col
     jmp     @@score
 
 @@win:
+    ; You Win — green
     mov     ecx, 11
     mov     edx, 10
     lea     r8, [str_you_win]
-    call    write_str_at
+    mov     r9b, ATTR_WIN
+    call    write_str_at_col
 
 @@score:
+    ; Score — yellow
     mov     ecx, 0
     mov     edx, 13
     lea     r8, [str_score_text]
-    call    write_str_at
+    mov     r9b, ATTR_GOLD
+    call    write_str_at_col
 
     mov     ecx, 7
     mov     edx, 13
     mov     r8d, [player_score]
-    call    write_num_at
+    mov     r9b, ATTR_GOLD
+    call    write_num_at_col
 
     call    frame_render
     add     rsp, 40

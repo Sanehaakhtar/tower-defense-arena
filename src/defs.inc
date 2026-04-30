@@ -33,9 +33,9 @@ TOWER_STRUCT_SIZE       equ 48
 MAX_LEVELS              equ 5
 WAVES_PER_LEVEL         equ 3
 ; Enemies in wave = ENEMY_BASE + (wave_in_level * ENEMY_WAVE_INC) + (level * ENEMY_LEVEL_INC)
-ENEMY_BASE              equ 4
-ENEMY_WAVE_INC          equ 3
-ENEMY_LEVEL_INC         equ 3
+ENEMY_BASE              equ 3
+ENEMY_WAVE_INC          equ 2
+ENEMY_LEVEL_INC         equ 2
 
 ; Game states
 STATE_MENU              equ 0
@@ -78,7 +78,7 @@ STARTING_GOLD           equ 50
 TOWER_COST_BASIC        equ 20
 TOWER_COST_SNIPER       equ 40
 TOWER_COST_SPLASH       equ 30
-STARTING_LIVES          equ 3
+STARTING_LIVES          equ 20
 KILL_REWARD             equ 5
 
 ; Spawn interval
@@ -135,6 +135,7 @@ VK_Q                    equ 51h
 ; ============================================================================
 extrn GetStdHandle:proc
 extrn WriteConsoleOutputCharacterA:proc
+extrn WriteConsoleOutputA:proc
 extrn SetConsoleCursorPosition:proc
 extrn ReadConsoleInputA:proc
 extrn GetNumberOfConsoleInputEvents:proc
